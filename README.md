@@ -1,4 +1,4 @@
-# GGUF Chatbot — RTX 4050 6 GB Optimised
+# GGUF Chatbot 
 
 Single-file Python chatbot for GGUF models.  
 Streams output · GPU offloading · auto context trimming · zero idle RAM.
