@@ -111,28 +111,70 @@ def c(color: str, text: str) -> str:
 # Model loading
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _fix_chat_template(model_path: str) -> str | None:
+    """Read and fix the model's chat template (LiquidAI models use custom
+    `{% generation %}` tags that Jinja2 doesn't support).
+
+    ponytail: strips custom generation tags; upstream fix when
+    llama-cpp-python supports them natively.
+    """
+    try:
+        from gguf import GGUFReader
+        reader = GGUFReader(model_path)
+        field = reader.fields.get("tokenizer.chat_template")
+        if field is None:
+            return None
+        t = bytes(field.parts[-1]).decode("utf-8", errors="replace")
+        for pat in (
+            "{%- generation -%}", "{%- endgeneration -%}",
+            "{% generation %}", "{% endgeneration %}",
+            "{%- generation %}", "{% generation -%}",
+            "{%- endgeneration %}", "{% endgeneration -%}",
+        ):
+            t = t.replace(pat, "")
+        return t
+    except Exception:
+        return None
+
+
 def load_model(args) -> Llama:
     print(c("yellow", f"\n  Loading {Path(args.model).name} …"), flush=True)
     t0 = time.time()
 
-    llm = Llama(
-        model_path       = args.model,
-        n_gpu_layers     = args.gpu_layers,
-        n_ctx            = args.ctx,
-        n_batch          = args.batch,
-        n_ubatch         = args.batch,
-        n_threads        = args.threads,
-        n_threads_batch  = args.threads,
-        flash_attn       = DEFAULTS["flash_attn"],
-        use_mmap         = DEFAULTS["use_mmap"],
-        use_mlock        = DEFAULTS["use_mlock"],
-        offload_kqv      = DEFAULTS["offload_kqv"],
-        type_k           = args.kv_bits,
-        type_v           = args.kv_bits,
-        rope_scaling_type= DEFAULTS["rope_scaling_type"],
-        verbose          = args.verbose,
-        seed             = args.seed,
-    )
+    from llama_cpp._internals import LlamaModel
+
+    fixed_template = _fix_chat_template(args.model)
+    _orig_md = LlamaModel.metadata
+
+    if fixed_template:
+        def _patched_metadata(self):
+            md = _orig_md(self)
+            if "tokenizer.chat_template" in md:
+                md["tokenizer.chat_template"] = fixed_template
+            return md
+        LlamaModel.metadata = _patched_metadata
+
+    try:
+        llm = Llama(
+            model_path       = args.model,
+            n_gpu_layers     = args.gpu_layers,
+            n_ctx            = args.ctx,
+            n_batch          = args.batch,
+            n_ubatch         = args.batch,
+            n_threads        = args.threads,
+            n_threads_batch  = args.threads,
+            flash_attn       = DEFAULTS["flash_attn"],
+            use_mmap         = DEFAULTS["use_mmap"],
+            use_mlock        = DEFAULTS["use_mlock"],
+            offload_kqv      = DEFAULTS["offload_kqv"],
+            type_k           = args.kv_bits,
+            type_v           = args.kv_bits,
+            rope_scaling_type= DEFAULTS["rope_scaling_type"],
+            verbose          = args.verbose,
+            seed             = args.seed,
+        )
+    finally:
+        LlamaModel.metadata = _orig_md
 
     elapsed = time.time() - t0
     print(c("green", f"  ✓ Loaded in {elapsed:.1f}s"), flush=True)
@@ -380,52 +422,66 @@ def main():
     # Token budget for auto-trim: leave 25 % for the reply
     trim_budget = int(args.ctx * 0.75)
 
+    # Auto-restore persistent memory
+    save_path = Path(args.model).with_suffix(".chat.json")
+    if save_path.exists():
+        try:
+            history.load(str(save_path))
+            print(c("dim", f"  Restored {len(history.turns)} turns from {save_path.name}\n"))
+        except Exception:
+            pass
+
     print(c("dim", "  Type your message and press Enter. /help for commands.\n"))
 
-    while True:
-        try:
-            user_input = input(c("green", "You: ")).strip()
-        except (EOFError, KeyboardInterrupt):
-            print(c("dim", "\n  Bye!"))
-            break
-
-        if not user_input:
-            continue
-
-        if user_input.startswith("/"):
-            if not handle_command(user_input, llm, history, args):
-                print(c("dim", "  Bye!"))
+    try:
+        while True:
+            try:
+                user_input = input(c("green", "You: ")).strip()
+            except (EOFError, KeyboardInterrupt):
+                print(c("dim", "\n  Bye!"))
                 break
-            continue
 
-        history.add("user", user_input)
+            if not user_input:
+                continue
 
-        # Trim history if approaching context limit
-        history.trim_to_tokens(llm, trim_budget)
+            if user_input.startswith("/"):
+                if not handle_command(user_input, llm, history, args):
+                    print(c("dim", "  Bye!"))
+                    break
+                continue
 
+            history.add("user", user_input)
+
+            # Trim history if approaching context limit
+            history.trim_to_tokens(llm, trim_budget)
+
+            try:
+                t0       = time.time()
+                reply    = generate(llm, history, args)
+                elapsed  = time.time() - t0
+
+                # Approximate tokens/s
+                tok_est  = max(len(reply) // 4, 1)
+                tps      = tok_est / elapsed
+                print(c("grey", f"  [{elapsed:.1f}s  ~{tps:.0f} tok/s]\n"))
+
+                history.add("assistant", reply)
+
+            except KeyboardInterrupt:
+                print(c("yellow", "\n  ⚠ Generation interrupted.\n"))
+                # Don't add partial reply to history
+                history.turns.pop()  # remove the user turn too, keep history consistent
+
+            except Exception as e:
+                print(c("red", f"\n  [ERROR] {e}\n"))
+    finally:
+        # Auto-save persistent memory on exit
         try:
-            t0       = time.time()
-            reply    = generate(llm, history, args)
-            elapsed  = time.time() - t0
-
-            # Approximate tokens/s
-            tok_est  = max(len(reply) // 4, 1)
-            tps      = tok_est / elapsed
-            print(c("grey", f"  [{elapsed:.1f}s  ~{tps:.0f} tok/s]\n"))
-
-            history.add("assistant", reply)
-
-        except KeyboardInterrupt:
-            print(c("yellow", "\n  ⚠ Generation interrupted.\n"))
-            # Don't add partial reply to history
-            history.turns.pop()  # remove the user turn too, keep history consistent
-
-        except Exception as e:
-            print(c("red", f"\n  [ERROR] {e}\n"))
-
-    # Clean shutdown
-    del llm
-    gc.collect()
+            history.save(str(save_path))
+        except Exception:
+            pass
+        del llm
+        gc.collect()
 
 
 if __name__ == "__main__":
